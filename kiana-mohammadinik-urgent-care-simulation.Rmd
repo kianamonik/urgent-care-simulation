@@ -732,7 +732,241 @@ run_system2_experiment <- function(n_weeks = 7, seed = 123){
 
 ```
 
-#### C) Run System 3: without switching vs with switching
+#### C) Run System 2 + required plot + daily cost
+
+```{r}
+res2 <- run_system2_experiment(n_weeks = 7, seed = 1)
+res2$overall
+
+# Daily cost: still 2 servers total (one at each stage), 9 hours/day
+cost2 <- compute_daily_cost(
+  total_wait_minutes_per_day = res2$overall$total_wait_minutes_per_day,
+  n_servers = 2
+)
+cost2
+
+# Plot: distribution of total waiting time
+hist(res2$customers$total_wait, breaks = 30,
+     main = "System 2 (Tandem): Total Waiting Time Distribution\n(7 weeks of customer waits)",
+     xlab = "Total waiting time (minutes)")
+
+```
+
+## System 3: one-day simulator (separate lines, optional switching)
+
+#### Switching rule (From chosen difficulty level: Hard)
+
+At each service completion, we allow switching if the difference in queue lengths is \>= 2. We move the last person in the longer line to the end of the shorter line. This would be helpful in scenarios where someone near the back decides to swap.
+
+#### A)
+
+```{r}
+simulate_day_system3 <- function(switching = FALSE, switch_threshold = 2, seed = NULL){
+  if (!is.null(seed)) set.seed(seed)
+
+  customers <- data.frame(
+    cust_id = integer(),
+    arrival_time = numeric(),
+    service_start = numeric(),
+    service_end = numeric(),
+    wait_time = numeric(),
+    chosen_line = integer()
+  )
+
+  # Two separate FIFO queues (store customer IDs)
+  q <- list(integer(), integer())
+
+  # Two servers
+  busy_until <- c(Inf, Inf)
+  server_job <- c(NA_integer_, NA_integer_)
+
+  is_idle <- function(s) busy_until[s] == Inf
+
+  # Event list
+  event_list <- data.frame(time = numeric(), type = character(), server = integer(), cust_id = integer())
+
+  next_id <- 1
+
+  # Choose a line at arrival: shorter queue (tie-break random)
+  choose_line <- function(){
+    len1 <- length(q[[1]])
+    len2 <- length(q[[2]])
+    if (len1 < len2) return(1L)
+    if (len2 < len1) return(2L)
+    sample(c(1L, 2L), 1) # tie
+  }
+
+  # Start service for a given server if idle and its queue nonempty
+  start_service <- function(t_now, s, event_list){
+    if (is_idle(s) && length(q[[s]]) > 0){
+      cid <- q[[s]][1]
+      q[[s]] <<- q[[s]][-1]
+
+      st <- t_now
+      svc <- sample_service_time(1)
+      et <- t_now + svc
+
+      customers$service_start[customers$cust_id == cid] <<- st
+      customers$service_end[customers$cust_id == cid]   <<- et
+      customers$wait_time[customers$cust_id == cid]     <<- st - customers$arrival_time[customers$cust_id == cid]
+
+      busy_until[s] <<- et
+      server_job[s] <<- cid
+
+      event_list <- add_event(event_list, time = et, type = "depart", server = s, cust_id = cid)
+    }
+    event_list
+  }
+
+  # Hard feature: allow switching after a departure event
+  do_switching_if_needed <- function(){
+    len1 <- length(q[[1]])
+    len2 <- length(q[[2]])
+    diff <- abs(len1 - len2)
+
+    if (diff >= switch_threshold){
+      longer <- if (len1 > len2) 1L else 2L
+      shorter <- if (longer == 1L) 2L else 1L
+
+      # move last person from longer to end of shorter
+      mover <- tail(q[[longer]], 1)
+      q[[longer]] <<- q[[longer]][-length(q[[longer]])]
+      q[[shorter]] <<- c(q[[shorter]], mover)
+    }
+  }
+
+  # schedule first arrival
+  t_first <- next_arrival_time(0)
+  if (is.finite(t_first) && t_first < T_END){
+    event_list <- add_event(event_list, time = t_first, type = "arrival")
+  }
+
+  # main loop
+  while (nrow(event_list) > 0){
+    popped <- pop_next_event(event_list)
+    ev <- popped$event
+    event_list <- popped$event_list
+    t_now <- ev$time
+
+    if (ev$type == "arrival"){
+      cid <- next_id
+      next_id <- next_id + 1
+
+      line <- choose_line()
+
+      customers <- rbind(
+        customers,
+        data.frame(
+          cust_id = cid,
+          arrival_time = t_now,
+          service_start = NA_real_,
+          service_end = NA_real_,
+          wait_time = NA_real_,
+          chosen_line = line
+        )
+      )
+
+      # join that line
+      q[[line]] <- c(q[[line]], cid)
+
+      # schedule next arrival
+      t_next <- next_arrival_time(t_now)
+      if (is.finite(t_next) && t_next < T_END){
+        event_list <- add_event(event_list, time = t_next, type = "arrival")
+      }
+
+      # try starting service on that line if its server is idle
+      event_list <- start_service(t_now, line, event_list)
+
+      # if the other server is idle, it can start too
+      other <- if (line == 1L) 2L else 1L
+      event_list <- start_service(t_now, other, event_list)
+
+    } else if (ev$type == "depart"){
+      s <- ev$server
+
+      # free server s
+      busy_until[s] <- Inf
+      server_job[s] <- NA_integer_
+
+      # optional switching happens at service completions
+      if (switching) do_switching_if_needed()
+
+      # start service on both servers if possible
+      event_list <- start_service(t_now, 1, event_list)
+      event_list <- start_service(t_now, 2, event_list)
+    }
+  }
+
+  customers
+}
+
+```
+
+#### B) Week + 7-week experiment wrappers (System 3)
+
+```{r}
+simulate_week_system3 <- function(switching = FALSE, switch_threshold = 2, seed = NULL){
+  if (!is.null(seed)) set.seed(seed)
+
+  days <- vector("list", 5)
+  for (d in 1:5){
+    days[[d]] <- simulate_day_system3(switching = switching, switch_threshold = switch_threshold)
+    days[[d]]$day <- d
+  }
+  do.call(rbind, days)
+}
+
+run_system3_experiment <- function(n_weeks = 7, switching = FALSE, switch_threshold = 2, seed = 123){
+  set.seed(seed)
+
+  all_weeks <- vector("list", n_weeks)
+  week_summaries <- data.frame(
+    week = integer(),
+    mean_wait = numeric(),
+    p90_wait = numeric(),
+    avg_customers_per_day = numeric(),
+    total_wait_minutes_per_day = numeric()
+  )
+
+  for (w in 1:n_weeks){
+    cust <- simulate_week_system3(switching = switching, switch_threshold = switch_threshold)
+    cust$week <- w
+    all_weeks[[w]] <- cust
+
+    daily_totals <- aggregate(wait_time ~ day, data = cust, FUN = function(x) sum(x, na.rm = TRUE))
+    mean_total_wait_per_day <- mean(daily_totals$wait_time)
+
+    waits <- cust$wait_time
+    waits <- waits[is.finite(waits)]
+
+    week_summaries <- rbind(
+      week_summaries,
+      data.frame(
+        week = w,
+        mean_wait = mean(waits),
+        p90_wait = unname(quantile(waits, 0.90)),
+        avg_customers_per_day = nrow(cust)/5,
+        total_wait_minutes_per_day = mean_total_wait_per_day
+      )
+    )
+  }
+
+  all_customer_data <- do.call(rbind, all_weeks)
+
+  overall <- data.frame(
+    mean_wait = mean(week_summaries$mean_wait),
+    p90_wait = mean(week_summaries$p90_wait),
+    avg_customers_per_day = mean(week_summaries$avg_customers_per_day),
+    total_wait_minutes_per_day = mean(week_summaries$total_wait_minutes_per_day)
+  )
+
+  list(customers = all_customer_data, week_summaries = week_summaries, overall = overall)
+}
+
+```
+
+#### C) Run System 3: without switching vs with switching + plot (distribution comparison)
 
 ```{r}
 # No switching
@@ -741,17 +975,13 @@ res3_no$overall
 cost3_no <- compute_daily_cost(res3_no$overall$total_wait_minutes_per_day, n_servers = 2)
 cost3_no
 
-# With switching for my chosen difficulty level (Hard)
+# With switching 
 res3_sw <- run_system3_experiment(n_weeks = 7, switching = TRUE, switch_threshold = 2, seed = 1)
 res3_sw$overall
 cost3_sw <- compute_daily_cost(res3_sw$overall$total_wait_minutes_per_day, n_servers = 2)
 cost3_sw
 
-```
-
-#### Plot: distribution comparison
-
-```{r}
+# plot (distribution comparison)
 hist(res3_no$customers$wait_time, breaks = 30,
      main = "System 3: Waiting Time Distribution (No Switching)",
      xlab = "Wait time (minutes)")
