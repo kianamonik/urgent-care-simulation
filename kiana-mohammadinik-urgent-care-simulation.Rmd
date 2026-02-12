@@ -251,12 +251,6 @@ simulate_day_system1 <- function(n_servers = 2, seed = NULL){
 
   # find an idle server index (or NA if none)
   idle_server <- function(){
-    idx <- which(!is.finite(busy_until))[1]
-    if (length(idx) == 0) return(NA_integer_)
-    idx
-  }
-
-  idle_server <- function(){
     idx <- which(busy_until == Inf)[1]
     if (length(idx) == 0) return(NA_integer_)
     idx
@@ -754,7 +748,7 @@ hist(res2$customers$total_wait, breaks = 30,
 
 ## System 3: one-day simulator (separate lines, optional switching)
 
-#### Switching rule (From chosen difficulty level: Hard)
+#### Switching rule (From my chosen difficulty level: Hard)
 
 At each service completion, we allow switching if the difference in queue lengths is \>= 2. We move the last person in the longer line to the end of the shorter line. This would be helpful in scenarios where someone near the back decides to swap.
 
@@ -991,3 +985,348 @@ hist(res3_sw$customers$wait_time, breaks = 30,
      xlab = "Wait time (minutes)")
 
 ```
+
+# Compare all systems (same 5 days × 7 weeks framework)
+
+```{r}
+# Helper: build a single summary row for any system result 
+make_row <- function(system_name, mean_wait, p90_wait, total_wait_minutes_per_day, n_server_hours_per_day){
+  cost <- compute_daily_cost(
+    total_wait_minutes_per_day = total_wait_minutes_per_day,
+    n_servers = 0 
+  )
+
+  # overwrite staffing cost using server-hours 
+  staffing_cost <- 30 * n_server_hours_per_day
+  waiting_cost  <- 0.50 * total_wait_minutes_per_day
+  total_cost    <- staffing_cost + waiting_cost
+
+  data.frame(
+    system = system_name,
+    mean_wait_min = mean_wait,
+    p90_wait_min = p90_wait,
+    total_wait_min_per_day = total_wait_minutes_per_day,
+    staffing_cost = staffing_cost,
+    waiting_cost = waiting_cost,
+    total_cost = total_cost
+  )
+}
+
+compare_core_systems <- function(seed = 1){
+  # System 1: pooled (2 servers all day)
+  res1 <- run_system1_experiment(n_weeks = 7, n_servers = 2, seed = seed)
+  row1 <- make_row(
+    system_name = "System 1: Pooled (2 servers)",
+    mean_wait = res1$overall$mean_wait,
+    p90_wait = res1$overall$p90_wait,
+    total_wait_minutes_per_day = res1$overall$total_wait_minutes_per_day,
+    n_server_hours_per_day = 2 * 9
+  )
+
+  # System 2: tandem (1 server at stage 1 + 1 at stage 2 = 2 total all day)
+  res2 <- run_system2_experiment(n_weeks = 7, seed = seed)
+  row2 <- make_row(
+    system_name = "System 2: Tandem (1+1 servers)",
+    mean_wait = res2$overall$mean_total_wait,
+    p90_wait = res2$overall$p90_total_wait,
+    total_wait_minutes_per_day = res2$overall$total_wait_minutes_per_day,
+    n_server_hours_per_day = 2 * 9
+  )
+
+  # System 3: separate lines, no switching (2 servers all day)
+  res3_no <- run_system3_experiment(n_weeks = 7, switching = FALSE, seed = seed)
+  row3 <- make_row(
+    system_name = "System 3: Separate (no switching)",
+    mean_wait = res3_no$overall$mean_wait,
+    p90_wait = res3_no$overall$p90_wait,
+    total_wait_minutes_per_day = res3_no$overall$total_wait_minutes_per_day,
+    n_server_hours_per_day = 2 * 9
+  )
+
+  # System 3: separate lines, with switching
+  res3_sw <- run_system3_experiment(n_weeks = 7, switching = TRUE, switch_threshold = 2, seed = seed)
+  row4 <- make_row(
+    system_name = "System 3: Separate (with switching)",
+    mean_wait = res3_sw$overall$mean_wait,
+    p90_wait = res3_sw$overall$p90_wait,
+    total_wait_minutes_per_day = res3_sw$overall$total_wait_minutes_per_day,
+    n_server_hours_per_day = 2 * 9
+  )
+
+  out <- rbind(row1, row2, row3, row4)
+  out <- out[order(out$total_cost), ]
+  out
+}
+
+comp <- compare_core_systems(seed = 1)
+comp
+
+```
+
+#### Sensitivity analysis: best minimal add-on (switching threshold)
+
+```{r}
+switch_sensitivity <- function(thresholds = c(1,2,3), seed = 1){
+  out <- data.frame()
+
+  for (th in thresholds){
+    res <- run_system3_experiment(n_weeks = 7, switching = TRUE, switch_threshold = th, seed = seed)
+
+    # staffing is same: 2 servers for 9 hours
+    staffing_cost <- 30 * (2 * 9)
+
+    waiting_cost <- 0.50 * res$overall$total_wait_minutes_per_day
+    total_cost <- staffing_cost + waiting_cost
+
+    out <- rbind(out, data.frame(
+      threshold = th,
+      mean_wait = res$overall$mean_wait,
+      p90_wait = res$overall$p90_wait,
+      total_wait_min_per_day = res$overall$total_wait_minutes_per_day,
+      total_cost = total_cost
+    ))
+  }
+
+  out
+}
+
+tab_switch <- switch_sensitivity(c(1,2,3), seed = 1)
+print(tab_switch)
+```
+
+The results were not strictly monotone: a **moderate switching rule (threshold = 2)** produced the lowest mean and tail waiting times and the lowest cost among the switching scenarios. Both **more aggressive switching (threshold = 1)** and **less frequent switching (threshold = 3)** performed slightly worse, likely because excessive switching can create churn without consistently improving balance. Importantly, across all thresholds, System 3 remained more expensive than pooled service, so the overall conclusion (System 1 is lowest cost) did not change. Even at its best (threshold = 2), System 3’s cost (**\$587.56/day**) is still higher than System 1 pooled (**\$562.38/day**).
+
+#### Plot to support conclusion:
+
+```{r}
+# compare pooled vs best separate (switching)
+plot_ecdf_compare <- function(waits_a, waits_b, name_a, name_b,
+                              col_a = "blue", col_b = "red", lwd = 2){
+  waits_a <- waits_a[is.finite(waits_a)]
+  waits_b <- waits_b[is.finite(waits_b)]
+
+  ec_a <- ecdf(waits_a)
+  ec_b <- ecdf(waits_b)
+
+  plot(ec_a,
+       main = "ECDF of Waiting Times (Higher curve = better)",
+       xlab = "Waiting time (minutes)",
+       ylab = "P(Wait =< x)",
+       col = col_a, lwd = lwd)
+
+  lines(ec_b, col = col_b, lwd = lwd)
+
+  legend("bottomright",
+         legend = c(name_a, name_b),
+         col = c(col_a, col_b),
+         lwd = c(lwd, lwd),
+         bty = "n")
+}
+
+
+res1 <- run_system1_experiment(n_weeks = 7, n_servers = 2, seed = 1)
+res3_sw <- run_system3_experiment(n_weeks = 7, switching = TRUE, switch_threshold = 2, seed = 1)
+res2 <- run_system2_experiment(n_weeks = 7, seed = 1)
+
+# Best vs separate-with-switching
+plot_ecdf_compare(
+  res1$customers$wait_time,
+  res3_sw$customers$wait_time,
+  "System 1: Pooled",
+  "System 3: Separate (switching)",
+  col_a = "blue", col_b = "darkgreen"
+)
+
+# Best vs tandem (total wait)
+plot_ecdf_compare(
+  res1$customers$wait_time,
+  res2$customers$total_wait,
+  "System 1: Pooled",
+  "System 2: Tandem (total wait)",
+  col_a = "blue", col_b = "red"
+)
+
+```
+
+## 3) Realism feature + sensitivity: 2 vs 3 servers during 12–1pm (choose cheaper total cost)
+
+#### Pooled system with a lunch-only extra server
+
+```{r}
+simulate_day_system1_lunch_extra <- function(seed = NULL){
+  if (!is.null(seed)) set.seed(seed)
+
+  customers <- data.frame(
+    cust_id = integer(),
+    arrival_time = numeric(),
+    service_start = numeric(),
+    service_end = numeric(),
+    wait_time = numeric(),
+    server = integer()
+  )
+
+  queue <- integer()
+
+  # 3 servers exist, but server 3 can only START jobs during lunch (240-300)
+  busy_until <- c(Inf, Inf, Inf)
+  server_job <- c(NA_integer_, NA_integer_, NA_integer_)
+
+  server_can_start <- function(s, t_now){
+    if (s %in% c(1,2)) return(TRUE)
+    # server 3:
+    (t_now >= T_LUNCH_START) && (t_now < T_LUNCH_END)
+  }
+
+  idle_servers <- function(t_now){
+    which(busy_until == Inf & sapply(1:3, function(s) server_can_start(s, t_now)))
+  }
+
+  start_service_if_possible <- function(t_now, event_list){
+    ids <- idle_servers(t_now)
+    while (length(ids) > 0 && length(queue) > 0){
+      s <- ids[1]
+      cid <- queue[1]
+      queue <<- queue[-1]
+
+      st <- t_now
+      svc <- sample_service_time(1)
+      et <- t_now + svc
+
+      customers$service_start[customers$cust_id == cid] <<- st
+      customers$service_end[customers$cust_id == cid]   <<- et
+      customers$wait_time[customers$cust_id == cid]     <<- st - customers$arrival_time[customers$cust_id == cid]
+      customers$server[customers$cust_id == cid]        <<- s
+
+      busy_until[s] <<- et
+      server_job[s] <<- cid
+
+      event_list <- add_event(event_list, time = et, type = "depart", server = s, cust_id = cid)
+
+      ids <- idle_servers(t_now)
+    }
+    event_list
+  }
+
+  event_list <- data.frame(time = numeric(), type = character(), server = integer(), cust_id = integer())
+  t_first <- next_arrival_time(0)
+  if (is.finite(t_first) && t_first < T_END){
+    event_list <- add_event(event_list, time = t_first, type = "arrival")
+  }
+
+  next_id <- 1
+
+  while (nrow(event_list) > 0){
+    popped <- pop_next_event(event_list)
+    ev <- popped$event
+    event_list <- popped$event_list
+    t_now <- ev$time
+
+    if (ev$type == "arrival"){
+      cid <- next_id; next_id <- next_id + 1
+      customers <- rbind(customers, data.frame(
+        cust_id = cid, arrival_time = t_now,
+        service_start = NA_real_, service_end = NA_real_, wait_time = NA_real_, server = NA_integer_
+      ))
+
+      queue <- c(queue, cid)
+
+      t_next <- next_arrival_time(t_now)
+      if (is.finite(t_next) && t_next < T_END){
+        event_list <- add_event(event_list, time = t_next, type = "arrival")
+      }
+
+      event_list <- start_service_if_possible(t_now, event_list)
+
+    } else if (ev$type == "depart"){
+      s <- ev$server
+      busy_until[s] <- Inf
+      server_job[s] <- NA_integer_
+
+      # after any departure, try to start jobs again 
+      event_list <- start_service_if_possible(t_now, event_list)
+    }
+  }
+
+  customers
+}
+
+simulate_week_system1_lunch_extra <- function(seed = NULL){
+  if (!is.null(seed)) set.seed(seed)
+  days <- vector("list", 5)
+  for (d in 1:5){
+    days[[d]] <- simulate_day_system1_lunch_extra()
+    days[[d]]$day <- d
+  }
+  do.call(rbind, days)
+}
+
+run_system1_lunch_extra_experiment <- function(n_weeks = 7, seed = 123){
+  set.seed(seed)
+
+  week_summaries <- data.frame(week=integer(), mean_wait=numeric(), p90_wait=numeric(), total_wait_minutes_per_day=numeric())
+  all_weeks <- vector("list", n_weeks)
+
+  for (w in 1:n_weeks){
+    cust <- simulate_week_system1_lunch_extra()
+    cust$week <- w
+    all_weeks[[w]] <- cust
+
+    daily_totals <- aggregate(wait_time ~ day, data = cust, FUN = function(x) sum(x, na.rm=TRUE))
+    mean_total_wait_per_day <- mean(daily_totals$wait_time)
+
+    waits <- cust$wait_time
+    waits <- waits[is.finite(waits)]
+
+    week_summaries <- rbind(week_summaries, data.frame(
+      week=w,
+      mean_wait = mean(waits),
+      p90_wait = unname(quantile(waits, 0.90)),
+      total_wait_minutes_per_day = mean_total_wait_per_day
+    ))
+  }
+
+  overall <- data.frame(
+    mean_wait = mean(week_summaries$mean_wait),
+    p90_wait = mean(week_summaries$p90_wait),
+    total_wait_minutes_per_day = mean(week_summaries$total_wait_minutes_per_day)
+  )
+
+  list(customers = do.call(rbind, all_weeks), week_summaries = week_summaries, overall = overall)
+}
+
+```
+
+#### Running the staffing tradeoff
+
+```{r}
+# Baseline pooled: 2 servers all day
+res1_base <- run_system1_experiment(n_weeks = 7, n_servers = 2, seed = 1)
+row_base <- make_row(
+  "System 1: Pooled (2 servers all day)",
+  mean_wait = res1_base$overall$mean_wait,
+  p90_wait = res1_base$overall$p90_wait,
+  total_wait_minutes_per_day = res1_base$overall$total_wait_minutes_per_day,
+  n_server_hours_per_day = 2*9
+)
+
+# Lunch staffing: +1 server during 12–1 => adds 1 server-hour/day
+res1_lunch <- run_system1_lunch_extra_experiment(n_weeks = 7, seed = 1)
+row_lunch <- make_row(
+  "System 1: Pooled (3rd server during 12–1)",
+  mean_wait = res1_lunch$overall$mean_wait,
+  p90_wait = res1_lunch$overall$p90_wait,
+  total_wait_minutes_per_day = res1_lunch$overall$total_wait_minutes_per_day,
+  n_server_hours_per_day = 2*9 + 1
+)
+
+rbind(row_base, row_lunch)[order(c(row_base$total_cost, row_lunch$total_cost)), ]
+
+```
+
+#### Decision definition:
+
+**I define the best** queueing **system as the one that minimizes total expected daily cost = staffing cost + waiting cost, where waiting cost is** \$0.50 per customer-minute and staffing cost is \$30 per server-hour (9 hours/day).
+
+#### **Final recommendation:** 
+
+Based on 7 simulated work weeks (5 days each), the system with the lowest expected daily total cost is System 1 (single pooled line with two parallel servers). Under System 1, the estimated mean waiting time is 1.16 minutes and the 90th percentile waiting time is 4.34 minutes, with an average of 44.76 total waiting minutes per day. This corresponds to an expected daily waiting cost of \$22.38, staffing cost of \$540, and total expected daily cost of \$562.38. In comparison, separate lines performed worse even with switching (\$587.56/day, mean wait 2.50 min), and tandem service performed dramatically worse (\$1095.81/day, mean total wait 29.19 min). Therefore, I recommend the urgent care operate a single pooled queue feeding two servers.
